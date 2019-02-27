@@ -1,142 +1,81 @@
-#!/usr/bin/env groovy
+#!/usr/bin/groovy
 
-// Application-specific Values
-def mavenArgs="-Dcom.redhat.xpaas.repo.redhatga"     // Global maven arguments
-def mavenPackageArgs="package spring-boot:repackage" // Maven package arguments
-def mavenOutputJar="parksmap-web.jar"                // Output jar from Maven
-def appName="parksmap"                               // Application name (for route, buildconfig, deploymentconfig)
-def previewAppName="parksmap"                        // Application used for viewing/testing
+@Library('github.com/fabric8io/fabric8-pipeline-library@master')
+def canaryVersion = "1.0.${env.BUILD_NUMBER}"
+def utils = new io.fabric8.Utils()
+def stashName = "buildpod.${env.JOB_NAME}.${env.BUILD_NUMBER}".replace('-', '_').replace('/', '_')
+def envStage = utils.environmentNamespace('stage')
+def envProd = utils.environmentNamespace('run')
+def setupScript = null
 
+mavenNode {
+  checkout scm
+  if (utils.isCI()) {
 
-// Pipeline variables
-def isPR=false                   // true if the branch being tested belongs to a PR
-def baseProject=""               // name of base project - used when testing a PR
-def project=""                   // project where build and deploy will occur
-def projectCreated=false         // true if a project was created by this build and needs to be cleaned up
-def repoUrl=""                   // the URL of this project's repository
-
-// uniqueName returns a name with a 16-character random character suffix
-def uniqueName = { String prefix ->
-  sh "cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 16 | head -n 1 > suffix"
-  suffix = readFile("suffix").trim()
-  return prefix + suffix
-}
-
-// setBuildStatus sets a status item on a GitHub commit
-def setBuildStatus = { String url, String context, String message, String state, String backref ->
-  step([
-    $class: "GitHubCommitStatusSetter",
-    reposSource: [$class: "ManuallyEnteredRepositorySource", url: url ],
-    contextSource: [$class: "ManuallyEnteredCommitContextSource", context: context ],
-    errorHandlers: [[$class: "ChangingBuildStatusErrorHandler", result: "UNSTABLE"]],
-    statusBackrefSource: [ $class: "ManuallyEnteredBackrefSource", backref: backref ],
-    statusResultSource: [ $class: "ConditionalStatusResultSource", results: [
-        [$class: "AnyBuildResult", message: message, state: state]] ]
-  ]);
-}
-
-// getRepoURL retrieves the origin URL of the current source repository
-def getRepoURL = {
-  sh "git config --get remote.origin.url > originurl"
-  return readFile("originurl").trim()
-}
-
-// getRouteHostname retrieves the host name from the given route in an
-// OpenShift namespace
-def getRouteHostname = { String routeName, String projectName ->
-  sh "oc get route ${routeName} -n ${projectName} -o jsonpath='{ .spec.host }' > apphost"
-  return readFile("apphost").trim()
-}
-
-// Initialize variables in default node context
-node {
-  isPR        = env.BRANCH_NAME ? env.BRANCH_NAME.startsWith("PR") : false
-  baseProject = env.PROJECT_NAME
-  project     = env.PROJECT_NAME
-}
-
-try { // Use a try block to perform cleanup in a finally block when the build fails
-
-  node ("maven") {
-
-    stage ('Checkout') {
-      checkout scm
-      repoUrl = getRepoURL()
-      stash includes: "ose3/pipeline-*.json", name: "artifact-template"
+    mavenCI {
+        integrationTestCmd =
+         "mvn org.apache.maven.plugins:maven-failsafe-plugin:integration-test \
+            org.apache.maven.plugins:maven-failsafe-plugin:verify \
+            -Dnamespace.use.current=false -Dnamespace.use.existing=${utils.testNamespace()} \
+            -Dit.test=*IT -DfailIfNoTests=false -DenableImageStreamDetection=true \
+            -P openshift-it"
     }
 
-    // When testing a PR, create a new project to perform the build 
-    // and deploy artifacts.
-    if (isPR) {
-      stage ('Create PR Project') {
-        setBuildStatus(repoUrl, "ci/app-preview", "Building application", "PENDING", "")
-        setBuildStatus(repoUrl, "ci/approve", "Aprove after testing", "PENDING", "") 
-        project = uniqueName("${appName}-")
-        sh "oc new-project ${project}"
-        projectCreated=true
-        sh "oc create serviceaccount jenkins -n ${project}"
-        sh "oc policy add-role-to-user view -z jenkins -n ${project}"
-        sh "oc policy add-role-to-group view system:authenticated -n ${project}"
+  } else if (utils.isCD()) {
+    /*
+     * Try to load the script ".openshiftio/Jenkinsfile.setup.groovy".
+     * If it exists it must contain two functions named "setupEnvironmentPre()"
+     * and "setupEnvironmentPost()" which should contain code that does any extra
+     * required setup in OpenShift specific for the booster. The Pre version will
+     * be called _before_ the booster objects are created while the Post version
+     * will be called afterwards.
+     */
+    try {
+      setupScript = load "${pwd()}/.openshiftio/Jenkinsfile.setup.groovy"
+    } catch (Exception ex) {
+      echo "Jenkinsfile.setup.groovy not found"
+    }
+
+    echo 'NOTE: running pipelines for the first time will take longer as build and base docker images are pulled onto the node'
+    container(name: 'maven', shell:'/bin/bash') {
+      stage('Build Image') {
+        mavenCanaryRelease {
+          version = canaryVersion
+        }
+        //stash deployment manifests
+        stash includes: '**/*.yml', name: stashName
       }
     }
-
-    stage ('Build') {
-      sh "mvn clean compile ${mavenArgs}"
-    }
-    
-    stage ('Run Unit Tests') {
-      sh "mvn test ${mavenArgs}"
-    }
-
-    stage ('Package') {
-      sh "mvn ${mavenPackageArgs} ${mavenArgs}"
-      sh "mv target/${mavenOutputJar} docker"
-      stash includes: "docker/*", name: "dockerbuild"
-    //TODO: push built artifact to artifact repository
-    }
   }
+}
 
+if (utils.isCD()) {
   node {
-    unstash "artifact-template"
-    unstash "dockerbuild"
+    stage('Rollout to Stage') {
+      unstash stashName
+      setupScript?.setupEnvironmentPre(envStage)
+      apply {
+        environment = envStage
+      }
+      setupScript?.setupEnvironmentPost(envStage)
+    }
 
-    stage ('Apply object configurations') {
-      if (isPR) {
-        sh "oc process -f ose3/pipeline-pr-application-template.json -v BASE_NAMESPACE=${baseProject} -n ${project} | oc apply -f - -n ${project}"
-      } else {
-        sh "oc process -f ose3/pipeline-application-template.json -n ${project} | oc apply -f - -n ${project}"
+    stage('Approve') {
+      approve {
+        room = null
+        version = canaryVersion
+        environment = 'Stage'
       }
     }
 
-    stage ('Build Image') {
-      sh "oc start-build ${appName}-docker --from-dir=./docker --follow -n ${project}"
-    }
-
-    stage ('Deploy') {
-      openshiftDeploy deploymentConfig: appName, namespace: project
-    }
-
-    if (isPR) {
-      stage ('Verify Service') {
-        openshiftVerifyService serviceName: previewAppName, namespace: project
+    stage('Rollout to Run') {
+      unstash stashName
+      setupScript?.setupEnvironmentPre(envProd)
+      apply {
+        environment = envProd
       }
-      def appHostName = getRouteHostname(previewAppName, project)
-      setBuildStatus(repoUrl, "ci/app-preview", "The application is available", "SUCCESS", "http://${appHostName}")
-      setBuildStatus(repoUrl, "ci/approve", "Approve after testing", "PENDING", "${env.BUILD_URL}input/") 
-      stage ('Manual Test') {
-        input "Is everything OK?"
-      }
-      setBuildStatus(repoUrl, "ci/app-preview", "Application previewed", "SUCCESS", "")
-      setBuildStatus(repoUrl, "ci/approve", "Manually approved", "SUCCESS", "")
-    }
-  }
-} 
-finally {
-  if (projectCreated) {
-    node {
-      stage('Delete PR Project') {
-        sh "oc delete project ${project}"
-      }
+      setupScript?.setupEnvironmentPost(envProd)
     }
   }
 }
+
